@@ -28,6 +28,7 @@ class CrazyflieModelNode(Node):
         torque = np.array([msg.torque.x, msg.torque.y, msg.torque.z])
 
         state = self.drone.forward(thrust, torque, self.dt)
+        
         self.publish_state(state)
 
     def publish_state(self, state):
@@ -72,4 +73,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-

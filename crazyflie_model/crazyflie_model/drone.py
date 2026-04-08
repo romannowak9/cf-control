@@ -1,57 +1,14 @@
 import numpy as np
+from utils import (
+    euler_to_quaternion,
+    quat_multiply,
+    quat_normalize,
+    quat_rotate,
+    rk4,
+    rotation_matrix_to_quaternion,
+)
 
 from .config import *
-
-
-def quat_multiply(q, p):
-    """Mnożenie kwaternionów."""
-    w1, x1, y1, z1 = q
-    w2, x2, y2, z2 = p
-
-    return np.array(
-        [
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        ]
-    )
-
-
-def quat_conjugate(q):
-    w, x, y, z = q
-    return np.array([w, -x, -y, -z])
-
-
-def quat_normalize(q):
-    return q / np.linalg.norm(q)
-
-
-def quat_rotate(q, v):
-    """
-    rotacja wektora v przez kwaternion q
-    """
-    v_quat = np.array([0, *v])
-
-    return quat_multiply(quat_multiply(q, v_quat), quat_conjugate(q))[1:]
-
-
-def euler_to_quaternion(roll, pitch, yaw):
-    cr = np.cos(roll / 2)
-    sr = np.sin(roll / 2)
-
-    cp = np.cos(pitch / 2)
-    sp = np.sin(pitch / 2)
-
-    cy = np.cos(yaw / 2)
-    sy = np.sin(yaw / 2)
-
-    w = cr * cp * cy + sr * sp * sy
-    x = sr * cp * cy - cr * sp * sy
-    y = cr * sp * cy + sr * cp * sy
-    z = cr * cp * sy - sr * sp * cy
-
-    return np.array([w, x, y, z])
 
 
 class Drone:
@@ -92,32 +49,12 @@ class Drone:
         Compute state from input values
 
         Returns:
-        - state: np.array - (r1,r2,r3,v1,v2,v3,q1,q2,q3,q4,omega1,omega2,omega3)
+        - state: np.array - (p1,p2,p3,v1,v2,v3,q1,q2,q3,q4,omega1,omega2,omega3)
         """
 
         state = np.concatenate([self.r, self.v, self.q, self.omega])
 
-        k1 = self.__state_derivative(state, thrust, torque)
-
-        k2 = self.__state_derivative(
-            state + 0.5 * dt * k1,
-            thrust,
-            torque,
-        )
-
-        k3 = self.__state_derivative(
-            state + 0.5 * dt * k2,
-            thrust,
-            torque,
-        )
-
-        k4 = self.__state_derivative(
-            state + dt * k3,
-            thrust,
-            torque,
-        )
-
-        state_next = state + (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+        state_next = rk4(self.__state_derivative, state, thrust, torque, dt)
 
         self.r = state_next[0:3]
         self.v = state_next[3:6]
@@ -126,15 +63,53 @@ class Drone:
 
         return state_next
 
-    def state_from_flat_out(self, pos, vel, jerk, snap, yaw, yaw_omega, yaw_acc):
+    def flat_out_state_and_control(self, pos, vel, acc, jerk, snap, yaw, yaw_dot, yaw_acc):
         """
         Compute state from flat output values
 
         Returns:
-        - state: np.array - (r1,r2,r3,v1,v2,v3,q1,q2,q3,q4,omega1,omega2,omega3)
+        - state and control : Tuple
+            (
+                - state: np.array - (p1,p2,p3,v1,v2,v3,q1,q2,q3,q4,omega1,omega2,omega3)
+                - control: np.array - (thrust, torque_x, torque_y, torque_z)
+            )
         """
 
-        q = np.zeros((4,))  # TODO Policzyć
-        omega = np.array([0.0, 0.0, yaw_omega])  # TODO: Policzyć
+        a_g = acc + np.array([0, 0, G])
+        thrust = self.mass * np.linalg.norm(a_g)
+        zb = a_g / np.linalg.norm(a_g)
+        xc = np.array([np.cos(yaw), np.sin(yaw), 0])
+        yb_cross_tmp = np.cross(zb, xc)
+        yb = yb_cross_tmp / np.linalg.norm(yb_cross_tmp)
+        xb = np.cross(yb, zb)
 
-        return np.concatenate([pos, vel, q, omega])
+        rotation = np.column_stack((xb, yb, zb))
+        q = rotation_matrix_to_quaternion(rotation)
+        q = quat_normalize(q)
+
+        h_omega = (self.mass / thrust) * (jerk - (jerk @ zb) * zb)
+
+        omega_x = -h_omega @ yb
+        omega_y = h_omega @ xb
+        zw = np.array([0, 0, 1])
+        omega_z = yaw_dot * (zw @ zb)
+
+        omega = np.array([omega_x, omega_y, omega_z])
+
+        omega_dot_x = (
+            (self.mass / thrust) * snap[0]
+            - 2 * (self.mass / thrust) * jerk[2] * omega_y
+            - omega_x * omega_z
+        )
+        omega_dot_y = (
+            (self.mass / thrust) * snap[1]
+            - 2 * (self.mass / thrust) * jerk[2] * omega_x
+            - omega_y * omega_z
+        )
+        omega_dot_z = yaw_acc * (zw @ zb)
+
+        omega_dot = np.array([omega_dot_x, omega_dot_y, omega_dot_z])
+
+        torque = self.J @ omega_dot + np.cross(omega, self.J @ omega)
+
+        return np.concatenate([pos, vel, q, omega]), np.concatenate([[thrust], torque])
