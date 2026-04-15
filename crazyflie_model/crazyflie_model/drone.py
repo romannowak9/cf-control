@@ -1,5 +1,7 @@
 import numpy as np
-from utils import (
+
+from crazyflie_model.config import *
+from crazyflie_model.utils import (
     euler_to_quaternion,
     quat_multiply,
     quat_normalize,
@@ -8,15 +10,16 @@ from utils import (
     rotation_matrix_to_quaternion,
 )
 
-from .config import *
-
 
 class Drone:
-    def __init__(self, mass=MASS, inertia_matrix=J, init_pose=INIT_POSE, init_vel=INIT_VEL):
+    def __init__(
+        self, mass=MASS, inertia_matrix=J, init_pose=INIT_POSE, init_vel=INIT_VEL, gravity=G
+    ):
 
         self.mass = mass
         self.J = inertia_matrix
         self.J_inv = np.linalg.inv(self.J)
+        self.gravity = gravity
 
         # Initial state
         self.r = np.array(init_pose[:3], dtype=float)
@@ -34,7 +37,7 @@ class Drone:
         thrust_body = np.array([0.0, 0.0, thrust])
         thrust_world = quat_rotate(q, thrust_body)
 
-        v_dot = np.array([0.0, 0.0, -G]) + (1 / self.mass) * thrust_world
+        v_dot = np.array([0.0, 0.0, -self.gravity]) + (1 / self.mass) * thrust_world
 
         omega_quat = np.array([0.0, omega[0] / 2.0, omega[1] / 2.0, omega[2] / 2.0])
 
@@ -75,7 +78,7 @@ class Drone:
             )
         """
 
-        a_g = acc + np.array([0, 0, G])
+        a_g = acc + np.array([0, 0, self.gravity])
         thrust = self.mass * np.linalg.norm(a_g)
         zb = a_g / np.linalg.norm(a_g)
         xc = np.array([np.cos(yaw), np.sin(yaw), 0])
@@ -96,16 +99,18 @@ class Drone:
 
         omega = np.array([omega_x, omega_y, omega_z])
 
-        omega_dot_x = (
-            (self.mass / thrust) * snap[0]
-            - 2 * (self.mass / thrust) * jerk[2] * omega_y
-            - omega_x * omega_z
-        )
-        omega_dot_y = (
+        omega_dot_x = -(
             (self.mass / thrust) * snap[1]
             - 2 * (self.mass / thrust) * jerk[2] * omega_x
             - omega_y * omega_z
         )
+
+        omega_dot_y = (
+            (self.mass / thrust) * snap[0]
+            - 2 * (self.mass / thrust) * jerk[2] * omega_y
+            - omega_x * omega_z
+        )
+
         omega_dot_z = yaw_acc * (zw @ zb)
 
         omega_dot = np.array([omega_dot_x, omega_dot_y, omega_dot_z])
@@ -113,3 +118,19 @@ class Drone:
         torque = self.J @ omega_dot + np.cross(omega, self.J @ omega)
 
         return np.concatenate([pos, vel, q, omega]), np.concatenate([[thrust], torque])
+
+    def mellinger_control(self, pos, vel, acc, pos_t, vel_t, acc_t, k_p, k_v, k_r):
+
+        # Sekcja control z papera o Melingerze
+        error_pos = pos - pos_t
+        error_vel = vel - vel_t
+
+        Kp = np.eye(3) * k_p
+        Kv = np.eye(3) * k_v
+        Kr = np.eye(3) * k_r
+
+        zw = np.array([0, 0, 1])
+
+        F_des = (
+            (-Kp) @ error_pos - Kv @ error_vel + self.mass * self.gravity * zw + self.mass * acc_t
+        )

@@ -4,8 +4,8 @@ from geometry_msgs.msg import Wrench
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 
-from .config import *
-from .drone import Drone
+from crazyflie_model.config import *
+from crazyflie_model.drone import Drone
 
 
 class CrazyflieModelNode(Node):
