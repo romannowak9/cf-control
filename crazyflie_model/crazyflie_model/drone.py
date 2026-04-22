@@ -6,8 +6,10 @@ from crazyflie_model.utils import (
     quat_multiply,
     quat_normalize,
     quat_rotate,
+    quaternion_to_rotation_matrix,
     rk4,
     rotation_matrix_to_quaternion,
+    vee,
 )
 
 
@@ -119,18 +121,57 @@ class Drone:
 
         return np.concatenate([pos, vel, q, omega]), np.concatenate([[thrust], torque])
 
-    def mellinger_control(self, pos, vel, acc, pos_t, vel_t, acc_t, k_p, k_v, k_r):
+    def mellinger_control(
+        self,
+        curr_state,
+        pos_target,
+        vel_target,
+        yaw_target,
+        acc_target,
+        omega_target,
+        k_p=1,
+        k_v=1,
+        k_R=1,
+        k_omega=1,
+    ):
+        pos_curr = curr_state[:3]
+        vel_curr = curr_state[3:6]
+        q_curr = curr_state[6:10]
+        omega_curr = curr_state[10:13]
 
         # Sekcja control z papera o Melingerze
-        error_pos = pos - pos_t
-        error_vel = vel - vel_t
+        error_pos = pos_curr - pos_target
+        error_vel = vel_curr - vel_target
 
         Kp = np.eye(3) * k_p
         Kv = np.eye(3) * k_v
-        Kr = np.eye(3) * k_r
+        KR = np.eye(3) * k_R
+        Komega = np.eye(3) * k_omega
 
         zw = np.array([0, 0, 1])
 
         F_des = (
-            (-Kp) @ error_pos - Kv @ error_vel + self.mass * self.gravity * zw + self.mass * acc_t
+            (-Kp) @ error_pos
+            - Kv @ error_vel
+            + self.mass * self.gravity * zw
+            + self.mass * acc_target
         )
+
+        R_curr = quaternion_to_rotation_matrix(q_curr)
+        zb = R_curr[:, 2]
+
+        thrust = max(0.0, F_des @ zb)
+
+        zb_des = F_des / np.linalg.norm(F_des)
+        xc_des = np.array([np.cos(yaw_target), np.sin(yaw_target), 0])
+        yb_des_cross_temp = np.cross(zb_des, xc_des)
+        yb_des = yb_des_cross_temp / np.linalg.norm(yb_des_cross_temp)
+        xb_des = np.cross(yb_des, zb_des)
+
+        R_des = np.column_stack((xb_des, yb_des, zb_des))
+        error_R = vee(0.5 * (R_des.T @ R_curr - R_curr.T @ R_des))
+        error_omega = omega_curr - R_curr.T @ R_des @ omega_target
+
+        torque = -KR @ error_R - Komega * error_omega
+
+        return thrust, torque

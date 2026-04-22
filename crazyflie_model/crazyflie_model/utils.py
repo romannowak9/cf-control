@@ -130,3 +130,40 @@ def euler_to_quaternion(roll, pitch, yaw):
     z = cr * cp * sy - sr * sp * cy
 
     return np.array([w, x, y, z])
+
+
+def quaternion_to_euler(q):
+    """
+    q = [w, x, y, z]
+    zwraca: roll, pitch, yaw
+    """
+    w, x, y, z = q
+
+    # roll (x-axis rotation)
+    sinr_cosp = 2 * (w * x + y * z)
+    cosr_cosp = 1 - 2 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+    # pitch (y-axis rotation)
+    sinp = 2 * (w * y - z * x)
+    if np.abs(sinp) >= 1:
+        pitch = np.sign(sinp) * (np.pi / 2)  # gimbal lock
+    else:
+        pitch = np.arcsin(sinp)
+
+    # yaw (z-axis rotation)
+    siny_cosp = 2 * (w * z + x * y)
+    cosy_cosp = 1 - 2 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+    return np.array([roll, pitch, yaw])
+
+
+def vee(M):
+    return np.array(
+        [
+            M[2, 1],
+            M[0, 2],
+            M[1, 0],
+        ]
+    )
