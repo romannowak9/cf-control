@@ -29,12 +29,17 @@ class Drone:
         self.q = euler_to_quaternion(*init_pose[3:])
         self.omega = np.array(init_vel[3:], dtype=float)
 
+    def curr_state(self):
+        return np.concatenate([self.r, self.v, self.q, self.omega])
+
     def __state_derivative(self, state, thrust, torque):
         v = state[3:6]
         q = state[6:10]
         omega = state[10:13]
 
         r_dot = v
+
+        print('DEBUG thrust:', thrust, type(thrust), np.shape(thrust))
 
         thrust_body = np.array([0.0, 0.0, thrust])
         thrust_world = quat_rotate(q, thrust_body)
@@ -172,6 +177,7 @@ class Drone:
         error_R = vee(0.5 * (R_des.T @ R_curr - R_curr.T @ R_des))
         error_omega = omega_curr - R_curr.T @ R_des @ omega_target
 
-        torque = -KR @ error_R - Komega * error_omega
+        torque = -KR @ error_R - Komega @ error_omega
+        print(thrust, torque)
 
         return thrust, torque

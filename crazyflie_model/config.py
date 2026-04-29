@@ -2,7 +2,7 @@ import numpy as np
 
 INIT_POSE = np.array([0.0, 0.0, 17.425e-3, 0.0, 0.0, 0.0])
 INIT_VEL = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-MASS = 0.025
+MASS = 0.028
 J = np.array(
     [
         [16.571710e-06, 0.830806e-06, 0.718277e-06],
