@@ -65,11 +65,11 @@ def rotation_matrix_to_quaternion(R):
     return q / np.linalg.norm(q)
 
 
-def rk4(f, x, dt, *args):
-    k1 = f(x, *args)
-    k2 = f(x + 0.5 * dt * k1, *args)
-    k3 = f(x + 0.5 * dt * k2, *args)
-    k4 = f(x + dt * k3, *args)
+def rk4(f, x, dt, **kwargs):
+    k1 = f(x, **kwargs)
+    k2 = f(x + 0.5 * dt * k1, **kwargs)
+    k3 = f(x + 0.5 * dt * k2, **kwargs)
+    k4 = f(x + dt * k3, **kwargs)
 
     return x + (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
 

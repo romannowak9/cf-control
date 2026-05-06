@@ -26,7 +26,7 @@ class Drone:
         # Initial state
         self.r = np.array(init_pose[:3], dtype=float)
         self.v = np.array(init_vel[:3], dtype=float)
-        self.q = euler_to_quaternion(*init_pose[3:])
+        self.q = quat_normalize(euler_to_quaternion(*init_pose[3:]))
         self.omega = np.array(init_vel[3:], dtype=float)
 
     def curr_state(self):
@@ -39,8 +39,6 @@ class Drone:
 
         r_dot = v
 
-        print('DEBUG thrust:', thrust, type(thrust), np.shape(thrust))
-
         thrust_body = np.array([0.0, 0.0, thrust])
         thrust_world = quat_rotate(q, thrust_body)
 
@@ -48,7 +46,7 @@ class Drone:
 
         omega_quat = np.array([0.0, omega[0] / 2.0, omega[1] / 2.0, omega[2] / 2.0])
 
-        q_dot = quat_multiply(q, omega_quat)
+        q_dot = 0.5 * quat_multiply(q, omega_quat)
 
         omega_dot = self.J_inv @ (torque - np.cross(omega, self.J @ omega))
 
@@ -64,12 +62,14 @@ class Drone:
 
         state = np.concatenate([self.r, self.v, self.q, self.omega])
 
-        state_next = rk4(self.__state_derivative, state, thrust, torque, dt)
+        state_next = rk4(self.__state_derivative, state, dt, thrust=thrust, torque=torque)
 
         self.r = state_next[0:3]
         self.v = state_next[3:6]
         self.q = quat_normalize(state_next[6:10])
-        self.omega = state_next[10:13]
+        if not np.all(np.isfinite(self.q)):
+            self.q = np.array([1, 0, 0, 0])
+        self.omega = np.clip(state_next[10:13], -50.0, 50.0)
 
         return state_next
 
@@ -162,22 +162,39 @@ class Drone:
             + self.mass * acc_target
         )
 
-        R_curr = quaternion_to_rotation_matrix(q_curr)
-        zb = R_curr[:, 2]
+        norm_F = np.linalg.norm(F_des)
+        if norm_F < 1e-6:
+            return float(self.mass * self.gravity), np.zeros(3)
 
-        thrust = max(0.0, F_des @ zb)
-
-        zb_des = F_des / np.linalg.norm(F_des)
+        zb_des = F_des / norm_F
         xc_des = np.array([np.cos(yaw_target), np.sin(yaw_target), 0])
         yb_des_cross_temp = np.cross(zb_des, xc_des)
-        yb_des = yb_des_cross_temp / np.linalg.norm(yb_des_cross_temp)
+
+        norm_y = np.linalg.norm(yb_des_cross_temp)
+        if norm_y < 1e-6:
+            yb_des = np.array([0.0, 1.0, 0.0])
+        else:
+            yb_des = yb_des_cross_temp / norm_y
+
         xb_des = np.cross(yb_des, zb_des)
 
         R_des = np.column_stack((xb_des, yb_des, zb_des))
+
+        R_curr = quaternion_to_rotation_matrix(q_curr)
+        zb = R_curr[:, 2]
+
+        # thrust = float(np.clip(F_des @ zb, 0.0, 2.0 * self.mass * self.gravity))
+        thrust = float(np.linalg.norm(F_des))
+
         error_R = vee(0.5 * (R_des.T @ R_curr - R_curr.T @ R_des))
         error_omega = omega_curr - R_curr.T @ R_des @ omega_target
 
         torque = -KR @ error_R - Komega @ error_omega
-        print(thrust, torque)
+        torque = np.clip(torque, -1e-3, 1e-3)
+
+        if not np.all(np.isfinite(torque)):
+            torque = np.zeros(3)
+
+        print(torque, thrust)
 
         return thrust, torque
