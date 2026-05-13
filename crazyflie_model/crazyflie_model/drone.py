@@ -6,6 +6,7 @@ from crazyflie_model.utils import (
     quat_multiply,
     quat_normalize,
     quat_rotate,
+    quaternion_to_euler,
     quaternion_to_rotation_matrix,
     rk4,
     rotation_matrix_to_quaternion,
@@ -44,7 +45,7 @@ class Drone:
 
         v_dot = np.array([0.0, 0.0, -self.gravity]) + (1 / self.mass) * thrust_world
 
-        omega_quat = np.array([0.0, omega[0] / 2.0, omega[1] / 2.0, omega[2] / 2.0])
+        omega_quat = np.array([0.0, omega[0], omega[1], omega[2]])
 
         q_dot = 0.5 * quat_multiply(q, omega_quat)
 
@@ -124,16 +125,17 @@ class Drone:
 
         torque = self.J @ omega_dot + np.cross(omega, self.J @ omega)
 
-        return np.concatenate([pos, vel, q, omega]), np.concatenate([[thrust], torque])
+        return np.concatenate([pos, vel, q, omega]), np.concatenate([[thrust], torque]), omega_dot
 
     def mellinger_control(
         self,
         curr_state,
         pos_target,
         vel_target,
-        yaw_target,
-        acc_target,
+        q_target,
+        thrust_target,
         omega_target,
+        alpha,
         k_p=1,
         k_v=1,
         k_R=1,
@@ -143,6 +145,9 @@ class Drone:
         vel_curr = curr_state[3:6]
         q_curr = curr_state[6:10]
         omega_curr = curr_state[10:13]
+
+        yaw_target = quaternion_to_euler(q_target)[2]
+        R_target = quaternion_to_rotation_matrix(q_target)
 
         # Sekcja control z papera o Melingerze
         error_pos = pos_curr - pos_target
@@ -155,6 +160,8 @@ class Drone:
 
         zw = np.array([0, 0, 1])
 
+        acc_target = thrust_target / self.mass * R_target[:, 2] - self.gravity * zw
+
         F_des = (
             (-Kp) @ error_pos
             - Kv @ error_vel
@@ -164,15 +171,18 @@ class Drone:
 
         norm_F = np.linalg.norm(F_des)
         if norm_F < 1e-6:
-            return float(self.mass * self.gravity), np.zeros(3)
+            zb_des = np.array([0.0, 0.0, 1.0])
+        else:
+            zb_des = F_des / norm_F
 
-        zb_des = F_des / norm_F
         xc_des = np.array([np.cos(yaw_target), np.sin(yaw_target), 0])
         yb_des_cross_temp = np.cross(zb_des, xc_des)
 
         norm_y = np.linalg.norm(yb_des_cross_temp)
         if norm_y < 1e-6:
-            yb_des = np.array([0.0, 1.0, 0.0])
+            # Near-vertical degenerate case: fall back to reference y-column
+            yb_des = np.cross(zb_des, R_target[:, 1])
+            yb_des = yb_des / np.linalg.norm(yb_des)
         else:
             yb_des = yb_des_cross_temp / norm_y
 
@@ -184,13 +194,17 @@ class Drone:
         zb = R_curr[:, 2]
 
         # thrust = float(np.clip(F_des @ zb, 0.0, 2.0 * self.mass * self.gravity))
-        thrust = float(np.linalg.norm(F_des))
+        thrust = float(np.dot(F_des, zb))
 
         error_R = vee(0.5 * (R_des.T @ R_curr - R_curr.T @ R_des))
         error_omega = omega_curr - R_curr.T @ R_des @ omega_target
 
-        torque = -KR @ error_R - Komega @ error_omega
-        torque = np.clip(torque, -1e-3, 1e-3)
+        torque = (
+            -KR @ error_R
+            - Komega @ error_omega
+            + np.cross(omega_curr, self.J @ omega_curr)
+            + self.J @ alpha
+        )
 
         if not np.all(np.isfinite(torque)):
             torque = np.zeros(3)

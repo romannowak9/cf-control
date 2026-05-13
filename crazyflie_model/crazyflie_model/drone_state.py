@@ -48,6 +48,12 @@ class CrazyflieModelNode(Node):
         self.target_yaw = quaternion_to_euler(
             (msg.orientation.w, msg.orientation.x, msg.orientation.y, msg.orientation.z)
         )[2]
+        self.target_q = (
+            msg.orientation.w,
+            msg.orientation.x,
+            msg.orientation.y,
+            msg.orientation.z,
+        )
 
     def timer_callback(self):
         """Integracja stanu drona i publikacja co dt"""
@@ -58,7 +64,7 @@ class CrazyflieModelNode(Node):
             curr_state=curr_state,
             pos_target=self.target_pos,
             vel_target=self.target_vel,
-            yaw_target=self.target_yaw,
+            yaw_target=self.target_q,
             acc_target=np.array([0.0, 0.0, 0.0]),  # Celujemy w zawis/stałą prędkość
             omega_target=np.array([0.0, 0.0, 0.0]),
             k_p=4.5,
