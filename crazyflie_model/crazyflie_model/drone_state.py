@@ -28,6 +28,7 @@ class CrazyflieModelNode(Node):
         self.thrust = G * MASS  # to hover in initial state
         self.torque = np.zeros(3)  # to hover in initial state
 
+        self.target_q = np.array([1.0, 0.0, 0.0, 0.0])
         self.target_pos = np.array([0.0, 0.0, 1.0])  # Domyślnie zawis na 1m
         self.target_vel = np.array([0.0, 0.0, 0.0])
         self.target_yaw = 0.0
@@ -44,39 +45,72 @@ class CrazyflieModelNode(Node):
 
     def target_callback(self, msg: Pose):
         """Aktualizacja punktu docelowego"""
+
         self.target_pos = np.array([msg.position.x, msg.position.y, msg.position.z])
-        self.target_yaw = quaternion_to_euler(
-            (msg.orientation.w, msg.orientation.x, msg.orientation.y, msg.orientation.z)
-        )[2]
-        self.target_q = (
-            msg.orientation.w,
-            msg.orientation.x,
-            msg.orientation.y,
-            msg.orientation.z,
+
+        self.target_q = np.array(
+            [
+                msg.orientation.w,
+                msg.orientation.x,
+                msg.orientation.y,
+                msg.orientation.z,
+            ]
         )
 
-    def timer_callback(self):
-        """Integracja stanu drona i publikacja co dt"""
-        curr_state = self.drone.curr_state()
+        self.target_yaw = quaternion_to_euler(self.target_q)[2]
 
-        # Mellinger
+    def timer_callback(self):
+        """Full Mellinger pipeline"""
+
+        curr_state = self.drone.curr_state()
+        # 1. Generate flat outputs
+        (
+            pos_ref,
+            vel_ref,
+            acc_ref,
+            jerk_ref,
+            snap_ref,
+            yaw_ref,
+            yaw_dot_ref,
+            yaw_acc_ref,
+        ) = Drone.generate_reference_trajectory(
+            self.target_pos, self.target_yaw
+        )  # Na podstawie lokalizacji punktu i czasu dotarcia do niego generuję trajektorię, czyli oczekiwany stan w czasie (wektor wejść dla flat_out_state)
+
+        # 2. Differential flatness
+        ref_state, ref_control, ref_alpha = self.drone.flat_out_state_and_control(
+            pos_ref,
+            vel_ref,
+            acc_ref,
+            jerk_ref,
+            snap_ref,
+            yaw_ref,
+            yaw_dot_ref,
+            yaw_acc_ref,
+        )
+
+        # 3. Extract feedforward terms
+        ref_thrust = ref_control[0]
+        ref_omega = ref_state[10:13]
+
+        # 4. Mellinger controller
         self.thrust, self.torque = self.drone.mellinger_control(
             curr_state=curr_state,
-            pos_target=self.target_pos,
-            vel_target=self.target_vel,
-            yaw_target=self.target_q,
-            acc_target=np.array([0.0, 0.0, 0.0]),  # Celujemy w zawis/stałą prędkość
-            omega_target=np.array([0.0, 0.0, 0.0]),
+            ref_state=ref_state,
+            ref_thrust=ref_thrust,
+            ref_omega=ref_omega,  # po prostu omega z targewt state
+            ref_alpha=ref_alpha,  # czyli omega_dot
             k_p=4.5,
             k_v=3.5,
             k_R=0.5,
             k_omega=0.1,
         )
 
-        # Appply control
+        self.get_logger().info(f'thrust={self.thrust:.3f}, torque={self.torque}')
+
+        # 5. Apply dynamics
         state = self.drone.state_model(self.thrust, self.torque, self.dt)
 
-        # self.get_logger().info(f'State: {state}')
         self.publish_state(state)
         self.publish_drone_input(self.thrust, self.torque)
 

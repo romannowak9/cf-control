@@ -99,7 +99,12 @@ def quat_conjugate(q):
 
 
 def quat_normalize(q):
-    return q / np.linalg.norm(q)
+    norm = np.linalg.norm(q)
+
+    if norm < 1e-12:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+
+    return q / norm
 
 
 def quat_rotate(q, v):

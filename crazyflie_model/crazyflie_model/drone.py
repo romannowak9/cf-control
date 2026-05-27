@@ -91,7 +91,10 @@ class Drone:
         zb = a_g / np.linalg.norm(a_g)
         xc = np.array([np.cos(yaw), np.sin(yaw), 0])
         yb_cross_tmp = np.cross(zb, xc)
-        yb = yb_cross_tmp / np.linalg.norm(yb_cross_tmp)
+        if np.linalg.norm(yb_cross_tmp) < 1e-6:
+            yb = np.array([0.0, 1.0, 0.0])
+        else:
+            yb = yb_cross_tmp / np.linalg.norm(yb_cross_tmp)
         xb = np.cross(yb, zb)
 
         rotation = np.column_stack((xb, yb, zb))
@@ -130,12 +133,10 @@ class Drone:
     def mellinger_control(
         self,
         curr_state,
-        pos_target,
-        vel_target,
-        q_target,
-        thrust_target,
-        omega_target,
-        alpha,
+        ref_state,
+        ref_thrust,
+        ref_omega,
+        ref_alpha,
         k_p=1,
         k_v=1,
         k_R=1,
@@ -146,12 +147,12 @@ class Drone:
         q_curr = curr_state[6:10]
         omega_curr = curr_state[10:13]
 
-        yaw_target = quaternion_to_euler(q_target)[2]
-        R_target = quaternion_to_rotation_matrix(q_target)
+        pos_ref = ref_state[:3]
+        vel_ref = ref_state[3:6]
+        q_ref = ref_state[6:10]
 
-        # Sekcja control z papera o Melingerze
-        error_pos = pos_curr - pos_target
-        error_vel = vel_curr - vel_target
+        R_ref = quaternion_to_rotation_matrix(q_ref)
+        R_curr = quaternion_to_rotation_matrix(q_curr)
 
         Kp = np.eye(3) * k_p
         Kv = np.eye(3) * k_v
@@ -160,55 +161,85 @@ class Drone:
 
         zw = np.array([0, 0, 1])
 
-        acc_target = thrust_target / self.mass * R_target[:, 2] - self.gravity * zw
+        # Position / velocity errors
+        error_pos = pos_curr - pos_ref
+        error_vel = vel_curr - vel_ref
 
+        # Reference acceleration
+        acc_ref = ref_thrust / self.mass * R_ref[:, 2] - self.gravity * zw
+
+        # Desired force
         F_des = (
-            (-Kp) @ error_pos
-            - Kv @ error_vel
-            + self.mass * self.gravity * zw
-            + self.mass * acc_target
+            -Kp @ error_pos - Kv @ error_vel + self.mass * self.gravity * zw + self.mass * acc_ref
         )
 
         norm_F = np.linalg.norm(F_des)
+
         if norm_F < 1e-6:
             zb_des = np.array([0.0, 0.0, 1.0])
         else:
             zb_des = F_des / norm_F
 
-        xc_des = np.array([np.cos(yaw_target), np.sin(yaw_target), 0])
-        yb_des_cross_temp = np.cross(zb_des, xc_des)
+        yaw_ref = quaternion_to_euler(q_ref)[2]
 
-        norm_y = np.linalg.norm(yb_des_cross_temp)
-        if norm_y < 1e-6:
-            # Near-vertical degenerate case: fall back to reference y-column
-            yb_des = np.cross(zb_des, R_target[:, 1])
-            yb_des = yb_des / np.linalg.norm(yb_des)
-        else:
-            yb_des = yb_des_cross_temp / norm_y
+        xc_des = np.array([np.cos(yaw_ref), np.sin(yaw_ref), 0.0])
+
+        yb_des = np.cross(zb_des, xc_des)
+
+        if np.linalg.norm(yb_des) < 1e-6:
+            yb_des = np.cross(zb_des, R_ref[:, 1])
+
+        yb_des /= np.linalg.norm(yb_des)
 
         xb_des = np.cross(yb_des, zb_des)
 
         R_des = np.column_stack((xb_des, yb_des, zb_des))
 
-        R_curr = quaternion_to_rotation_matrix(q_curr)
         zb = R_curr[:, 2]
 
-        # thrust = float(np.clip(F_des @ zb, 0.0, 2.0 * self.mass * self.gravity))
-        thrust = float(np.dot(F_des, zb))
+        thrust = float(F_des @ zb)
 
         error_R = vee(0.5 * (R_des.T @ R_curr - R_curr.T @ R_des))
-        error_omega = omega_curr - R_curr.T @ R_des @ omega_target
+
+        error_omega = omega_curr - R_curr.T @ R_des @ ref_omega
 
         torque = (
             -KR @ error_R
             - Komega @ error_omega
             + np.cross(omega_curr, self.J @ omega_curr)
-            + self.J @ alpha
+            + self.J @ ref_alpha
         )
 
         if not np.all(np.isfinite(torque)):
             torque = np.zeros(3)
 
-        print(torque, thrust)
+        thrust = np.clip(thrust, 0.0, 4.5)
+        torque = np.clip(torque, -0.05, 0.05)
 
         return thrust, torque
+
+    @staticmethod
+    def generate_reference_trajectory(target_pos, target_yaw):
+        """
+        Generate hover trajectory toward target pose.
+        Full flat-output reference for Mellinger controller.
+        """
+
+        vel = np.zeros(3)
+        acc = np.zeros(3)
+        jerk = np.zeros(3)
+        snap = np.zeros(3)
+
+        yaw_dot = 0.0
+        yaw_acc = 0.0
+
+        return (
+            target_pos,
+            vel,
+            acc,
+            jerk,
+            snap,
+            target_yaw,
+            yaw_dot,
+            yaw_acc,
+        )
