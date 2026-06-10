@@ -17,12 +17,17 @@ class CrazyflieModelNode(Node):
         self.drone = Drone()
         self.dt = 0.002
 
-        # Sterowanie za pomocą zadanej pozycji i prędkości
+        # 1. Subskrypcja punktu docelowego (celu)
         self._target_sub = self.create_subscription(
             Pose, 'crazyflie/target_pose', self.target_callback, 10
         )
-        # Example coomand:
-        # ros2 topic pub /crazyflie/target_pose geometry_msgs/msg/Pose "{position: {x: 5.0, y: 5.0, z: 5.0}, orientation: {w: 1.0, x: 0.0, y: 0.0, z: 0.0}}"
+        # Przykładowa wiadomość
+        # ros2 topic pub --once /crazyflie/target_pose geometry_msgs/msg/Pose "{position: {x: 0.0, y: 0.0, z: 1.5}, orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}"
+
+        # 2. Subskrypcja rzeczywistej odometrii drona (sprzężenie zwrotne)
+        self._odom_sub = self.create_subscription(
+            Odometry, '/crazyflie/odom', self.odom_callback, 10
+        )
 
         # Aktualne sterowanie (inputs)
         self.thrust = G * MASS  # to hover in initial state
@@ -33,137 +38,144 @@ class CrazyflieModelNode(Node):
         self.target_vel = np.array([0.0, 0.0, 0.0])
         self.target_yaw = 0.0
 
-        self._state_pub = self.create_publisher(Odometry, 'crazyflie/state', 10)
+        # Zmienne do przechowywania aktualnego stanu z odometrii
+        # Wektor 13-elementowy: [pos(3), vel(3), quat(4), omega(3)]
+        self.curr_state = np.zeros(13)
+        self.state_received = False  # Flaga bezpieczeństwa
+
         # Bezpośrednie sterowanie za pomocą thrust i torque
         self._input_pub = self.create_publisher(ThrustAndTorque, '/cf_control/control_command', 10)
-        # Example command (Hover):
-        # ros2 topic pub /cf_control/control_command cf_control_msgs/msg/ThrustAndTorque "{collective_thrust: 0.295}"
 
+        # Timer pętli sterowania (częstotliwość 500Hz)
         self.timer = self.create_timer(self.dt, self.timer_callback)
 
-        self.get_logger().info('Crazyflie model node started.')
+        # Zmienne zarządzania czasem trajektorii
+        self.t_start = None  # Czas odebrania komendy (ros2 time)
+        self.T_flight = 3.0  # Zadeklarowany czas przelotu (np. 3 sekundy)
+
+        # Zmienne początkowe trajektorii
+        self.start_pos = np.array([0.0, 0.0, 0.0])
+        self.start_yaw = 0.0
+
+        self.get_logger().info('Crazyflie controller node started.')
 
     def target_callback(self, msg: Pose):
-        """Aktualizacja punktu docelowego"""
+        """Aktualizacja punktu docelowego i uruchomienie trajektorii"""
 
+        # Nie przypisujemy celu, jeśli nie znamy własnej pozycji z odometrii
+        if not self.state_received:
+            self.get_logger().warn('Cannot set target: No odometry received yet.')
+            return
+
+        # Ustawienie punktu początkowego jako obecnej pozycji z odometrii
+        self.start_pos = self.curr_state[:3].copy()
+        self.start_yaw = quaternion_to_euler(self.curr_state[6:10])[2]
+
+        # Ustawienie celu
         self.target_pos = np.array([msg.position.x, msg.position.y, msg.position.z])
+        target_q = np.array(
+            [msg.orientation.w, msg.orientation.x, msg.orientation.y, msg.orientation.z]
+        )
+        self.target_yaw = quaternion_to_euler(target_q)[2]
 
-        self.target_q = np.array(
+        # Resetowanie czasu - zaczynamy generację trajektorii od t=0
+        self.t_start = self.get_clock().now()
+
+        self.get_logger().info(
+            f'New target received! Planning {self.T_flight}s minimum-snap flight.'
+        )
+
+    def odom_callback(self, msg: Odometry):
+        """Aktualizacja rzeczywistego stanu drona z zewnętrznego źródła"""
+        pos = np.array(
+            [msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]
+        )
+        vel = np.array(
+            [msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z]
+        )
+        quat = np.array(
             [
-                msg.orientation.w,
-                msg.orientation.x,
-                msg.orientation.y,
-                msg.orientation.z,
+                msg.pose.pose.orientation.w,
+                msg.pose.pose.orientation.x,
+                msg.pose.pose.orientation.y,
+                msg.pose.pose.orientation.z,
             ]
         )
-
-        self.target_yaw = quaternion_to_euler(self.target_q)[2]
-
-    def timer_callback(self):
-        """Full Mellinger pipeline"""
-
-        curr_state = self.drone.curr_state()
-        # 1. Generate flat outputs
-        (
-            pos_ref,
-            vel_ref,
-            acc_ref,
-            jerk_ref,
-            snap_ref,
-            yaw_ref,
-            yaw_dot_ref,
-            yaw_acc_ref,
-        ) = Drone.generate_reference_trajectory(
-            self.target_pos, self.target_yaw
-        )  # Na podstawie lokalizacji punktu i czasu dotarcia do niego generuję trajektorię, czyli oczekiwany stan w czasie (wektor wejść dla flat_out_state)
-
-        # 2. Differential flatness
-        ref_state, ref_control, ref_alpha = self.drone.flat_out_state_and_control(
-            pos_ref,
-            vel_ref,
-            acc_ref,
-            jerk_ref,
-            snap_ref,
-            yaw_ref,
-            yaw_dot_ref,
-            yaw_acc_ref,
+        omega = np.array(
+            [msg.twist.twist.angular.x, msg.twist.twist.angular.y, msg.twist.twist.angular.z]
         )
 
-        # 3. Extract feedforward terms
-        ref_thrust = ref_control[0]
-        ref_omega = ref_state[10:13]
+        # Łączymy w jeden wektor stanu kompatybilny z Twoim kontrolerem
+        self.curr_state = np.concatenate([pos, vel, quat, omega])
+        self.state_received = True
 
-        # 4. Mellinger controller
+    def timer_callback(self):
+        """Full Mellinger pipeline (Czysty Kontroler)"""
+
+        if not self.state_received:
+            self.get_logger().warn('Waiting for odometry...', throttle_duration_sec=2.0)
+            return
+
+        curr_state = self.curr_state
+
+        # Oblicz, ile czasu upłynęło od odebrania targetu
+        if self.t_start is None:
+            # Jeśli nie podano jeszcze celu, zachowaj aktualną pozycję (t_eval = T_flight aby wymusić zawis w miejscu startu)
+            t_eval = self.T_flight
+            self.start_pos = curr_state[:3]
+            self.target_pos = curr_state[:3]
+            self.start_yaw = quaternion_to_euler(curr_state[6:10])[2]
+            self.target_yaw = self.start_yaw
+        else:
+            t_eval = (self.get_clock().now() - self.t_start).nanoseconds / 1e9
+
+        # 1. Wygeneruj flat outputs dla obecnej milisekundy t_eval
+        (pos_ref, vel_ref, acc_ref, jerk_ref, snap_ref, yaw_ref, yaw_dot_ref, yaw_acc_ref) = (
+            Drone.generate_reference_trajectory(
+                t_eval=t_eval,
+                T_flight=self.T_flight,
+                p0=self.start_pos,
+                pT=self.target_pos,
+                yaw0=self.start_yaw,
+                yawT=self.target_yaw,
+            )
+        )
+
+        # 2. Differential flatness (wykorzystuje Twoją zmodyfikowaną funkcję z poprawką B)
+        ref_state, ref_control, ref_alpha = self.drone.flat_out_state_and_control(
+            pos_ref, vel_ref, acc_ref, jerk_ref, snap_ref, yaw_ref, yaw_dot_ref, yaw_acc_ref
+        )
+
+        # 3. Mellinger controller
         self.thrust, self.torque = self.drone.mellinger_control(
             curr_state=curr_state,
             ref_state=ref_state,
-            ref_thrust=ref_thrust,
-            ref_omega=ref_omega,  # po prostu omega z targewt state
-            ref_alpha=ref_alpha,  # czyli omega_dot
-            k_p=4.5,
-            k_v=3.5,
-            k_R=0.5,
-            k_omega=0.1,
+            ref_thrust=ref_control[0],
+            ref_alpha=ref_alpha,
+            yaw_ref=yaw_ref,
+            k_p=K_P,
+            k_v=K_V,
+            k_R=K_R,
+            k_omega=K_OMEGA,
         )
 
-        self.get_logger().info(f'thrust={self.thrust:.3f}, torque={self.torque}')
-
-        # 5. Apply dynamics
-        state = self.drone.state_model(self.thrust, self.torque, self.dt)
-
-        self.publish_state(state)
+        # 4. Publikacja wyliczonego sterowania
         self.publish_drone_input(self.thrust, self.torque)
-
-    def publish_state(self, state):
-        msg = Odometry()
-
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'world'
-        msg.child_frame_id = 'crazyflie'
-
-        # position
-        msg.pose.pose.position.x = state[0]
-        msg.pose.pose.position.y = state[1]
-        msg.pose.pose.position.z = state[2]
-
-        # velocity
-        msg.twist.twist.linear.x = state[3]
-        msg.twist.twist.linear.y = state[4]
-        msg.twist.twist.linear.z = state[5]
-
-        # quaternion
-        msg.pose.pose.orientation.w = state[6]
-        msg.pose.pose.orientation.x = state[7]
-        msg.pose.pose.orientation.y = state[8]
-        msg.pose.pose.orientation.z = state[9]
-
-        # angular velocity
-        msg.twist.twist.angular.x = state[10]
-        msg.twist.twist.angular.y = state[11]
-        msg.twist.twist.angular.z = state[12]
-
-        self._state_pub.publish(msg)
 
     def publish_drone_input(self, thrust, torque):
         msg = ThrustAndTorque()
-
         msg.timestamp = int(self.get_clock().now().nanoseconds)
         msg.collective_thrust = float(thrust)
         msg.torque.x = torque[0]
         msg.torque.y = torque[1]
         msg.torque.z = torque[2]
-
         self._input_pub.publish(msg)
 
 
 def main(args=None):
-
     rclpy.init(args=args)
-
     node = CrazyflieModelNode()
-
     rclpy.spin(node)
-
     node.destroy_node()
     rclpy.shutdown()
 

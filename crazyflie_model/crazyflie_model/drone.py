@@ -6,7 +6,6 @@ from crazyflie_model.utils import (
     quat_multiply,
     quat_normalize,
     quat_rotate,
-    quaternion_to_euler,
     quaternion_to_rotation_matrix,
     rk4,
     rotation_matrix_to_quaternion,
@@ -85,47 +84,62 @@ class Drone:
                 - control: np.array - (thrust, torque_x, torque_y, torque_z)
             )
         """
+        m = self.mass
+        zw = np.array([0.0, 0.0, 1.0])
 
-        a_g = acc + np.array([0, 0, self.gravity])
-        thrust = self.mass * np.linalg.norm(a_g)
-        zb = a_g / np.linalg.norm(a_g)
-        xc = np.array([np.cos(yaw), np.sin(yaw), 0])
+        # 1. Wektor ciągu, jego moduł i oś z_B
+        t = acc + self.gravity * zw
+        norm_t = np.linalg.norm(t)
+        thrust = m * norm_t
+
+        if norm_t < 1e-6:
+            zb = zw
+        else:
+            zb = t / norm_t
+
+        # 2. Wyznaczenie osi x_B oraz y_B
+        xc = np.array([np.cos(yaw), np.sin(yaw), 0.0])
         yb_cross_tmp = np.cross(zb, xc)
+
         if np.linalg.norm(yb_cross_tmp) < 1e-6:
             yb = np.array([0.0, 1.0, 0.0])
         else:
             yb = yb_cross_tmp / np.linalg.norm(yb_cross_tmp)
+
         xb = np.cross(yb, zb)
 
+        # Obliczenie kwaternionu z macierzy rotacji
         rotation = np.column_stack((xb, yb, zb))
         q = rotation_matrix_to_quaternion(rotation)
         q = quat_normalize(q)
 
-        h_omega = (self.mass / thrust) * (jerk - (jerk @ zb) * zb)
+        # 3. Pierwsza pochodna ciągu i prędkości kątowe (wykorzystując Jerk)
+        u1_dot = m * np.dot(jerk, zb)
+        h_omega = (m * jerk - u1_dot * zb) / thrust
 
-        omega_x = -h_omega @ yb
-        omega_y = h_omega @ xb
-        zw = np.array([0, 0, 1])
-        omega_z = yaw_dot * (zw @ zb)
+        omega_x = -np.dot(h_omega, yb)
+        omega_y = np.dot(h_omega, xb)
+        omega_z = yaw_dot * np.dot(zw, zb)
 
         omega = np.array([omega_x, omega_y, omega_z])
 
-        omega_dot_x = -(
-            (self.mass / thrust) * snap[1]
-            - 2 * (self.mass / thrust) * jerk[2] * omega_x
-            - omega_y * omega_z
-        )
+        # 4. Druga pochodna ciągu i przyspieszenia kątowe (wykorzystując Snap)
+        # Wykorzystujemy u1_ddot = m * (s o zb) + thrust * ||h_omega||^2
+        u1_ddot = m * np.dot(snap, zb) + thrust * np.dot(h_omega, h_omega)
 
-        omega_dot_y = (
-            (self.mass / thrust) * snap[0]
-            - 2 * (self.mass / thrust) * jerk[2] * omega_y
-            - omega_x * omega_z
-        )
+        # Wektor h_alpha
+        h_alpha = (
+            m * snap - u1_ddot * zb - 2 * u1_dot * h_omega - thrust * np.cross(omega, h_omega)
+        ) / thrust
 
-        omega_dot_z = yaw_acc * (zw @ zb)
+        # Rzutowanie na osie lokalne drona
+        omega_dot_x = -np.dot(h_alpha, yb)
+        omega_dot_y = np.dot(h_alpha, xb)
+        omega_dot_z = yaw_acc * np.dot(zw, zb)
 
         omega_dot = np.array([omega_dot_x, omega_dot_y, omega_dot_z])
 
+        # 5. Wyliczenie momentów sił (Torque Feedforward)
         torque = self.J @ omega_dot + np.cross(omega, self.J @ omega)
 
         return np.concatenate([pos, vel, q, omega]), np.concatenate([[thrust], torque]), omega_dot
@@ -135,8 +149,8 @@ class Drone:
         curr_state,
         ref_state,
         ref_thrust,
-        ref_omega,
         ref_alpha,
+        yaw_ref,
         k_p=1,
         k_v=1,
         k_R=1,
@@ -150,6 +164,7 @@ class Drone:
         pos_ref = ref_state[:3]
         vel_ref = ref_state[3:6]
         q_ref = ref_state[6:10]
+        omega_ref = ref_state[10:13]
 
         R_ref = quaternion_to_rotation_matrix(q_ref)
         R_curr = quaternion_to_rotation_matrix(q_curr)
@@ -180,8 +195,6 @@ class Drone:
         else:
             zb_des = F_des / norm_F
 
-        yaw_ref = quaternion_to_euler(q_ref)[2]
-
         xc_des = np.array([np.cos(yaw_ref), np.sin(yaw_ref), 0.0])
 
         yb_des = np.cross(zb_des, xc_des)
@@ -201,13 +214,15 @@ class Drone:
 
         error_R = vee(0.5 * (R_des.T @ R_curr - R_curr.T @ R_des))
 
-        error_omega = omega_curr - R_curr.T @ R_des @ ref_omega
+        error_omega = omega_curr - R_curr.T @ R_des @ omega_ref
+
+        ref_alpha_body = R_curr.T @ R_des @ ref_alpha  # Obrót do układu lokalnego
 
         torque = (
             -KR @ error_R
             - Komega @ error_omega
             + np.cross(omega_curr, self.J @ omega_curr)
-            + self.J @ ref_alpha
+            + self.J @ ref_alpha_body
         )
 
         if not np.all(np.isfinite(torque)):
@@ -219,27 +234,50 @@ class Drone:
         return thrust, torque
 
     @staticmethod
-    def generate_reference_trajectory(target_pos, target_yaw):
+    def generate_reference_trajectory(t_eval, T_flight, p0, pT, yaw0, yawT):
         """
-        Generate hover trajectory toward target pose.
-        Full flat-output reference for Mellinger controller.
+        Generuje optymalną (minimum snap) trajektorię punkt-punkt w czasie t_eval.
+
+        Parametry:
+        - t_eval: aktualny czas od rozpoczęcia manewru (sekundy)
+        - T_flight: całkowity zaplanowany czas na wykonanie manewru (sekundy)
+        - p0, pT: pozycje startowa i docelowa (wektory 3D)
+        - yaw0, yawT: yaw startowy i docelowy (radiany)
         """
+        # Ogranicz czas do maksymalnego czasu lotu, aby dron zatrzymał się u celu
+        t = np.clip(t_eval, 0.0, T_flight)
 
-        vel = np.zeros(3)
-        acc = np.zeros(3)
-        jerk = np.zeros(3)
-        snap = np.zeros(3)
+        # Czas znormalizowany tau w przedziale [0, 1]
+        tau = t / T_flight
 
-        yaw_dot = 0.0
-        yaw_acc = 0.0
+        if t >= T_flight:
+            # Gdy dolecieliśmy, utrzymuj pozycję (zawis)
+            return pT, np.zeros(3), np.zeros(3), np.zeros(3), np.zeros(3), yawT, 0.0, 0.0
 
-        return (
-            target_pos,
-            vel,
-            acc,
-            jerk,
-            snap,
-            target_yaw,
-            yaw_dot,
-            yaw_acc,
-        )
+        # Współczynniki znormalizowanego wielomianu minimum snap 7. stopnia
+        # Wymusza zerową prędkość, przyspieszenie i szarpnięcie na początku (tau=0) i na końcu (tau=1)
+        c4, c5, c6, c7 = 35.0, -84.0, 70.0, -20.0
+
+        # Ewaluacja wielomianu i jego pochodnych po tau
+        p_tau = c4 * tau**4 + c5 * tau**5 + c6 * tau**6 + c7 * tau**7
+        dp_tau = 4 * c4 * tau**3 + 5 * c5 * tau**4 + 6 * c6 * tau**5 + 7 * c7 * tau**6
+        ddp_tau = 12 * c4 * tau**2 + 20 * c5 * tau**3 + 30 * c6 * tau**4 + 42 * c7 * tau**5
+        dddp_tau = 24 * c4 * tau + 60 * c5 * tau**2 + 120 * c6 * tau**3 + 210 * c7 * tau**4
+        ddddp_tau = 24 * c4 + 120 * c5 * tau + 360 * c6 * tau**2 + 840 * c7 * tau**3
+
+        # Transformacja przestrzenna (Spatial Scaling) i czasowa (Temporal Scaling) z artykułu Mellingera
+        delta_p = pT - p0
+        pos = p0 + delta_p * p_tau
+        vel = delta_p * dp_tau / T_flight
+        acc = delta_p * ddp_tau / (T_flight**2)
+        jerk = delta_p * dddp_tau / (T_flight**3)
+        snap = delta_p * ddddp_tau / (T_flight**4)
+
+        # Artykuł wspomina k_psi = 2 dla yaw (czyli minimum yaw acceleration), ale dla gładkości
+        # i wygody użyjemy tej samej kinematyki 7. stopnia co dla pozycji.
+        delta_yaw = yawT - yaw0
+        yaw = yaw0 + delta_yaw * p_tau
+        yaw_dot = delta_yaw * dp_tau / T_flight
+        yaw_acc = delta_yaw * ddp_tau / (T_flight**2)
+
+        return pos, vel, acc, jerk, snap, yaw, yaw_dot, yaw_acc
